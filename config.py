@@ -14,7 +14,22 @@ BOT = {
 }
 
 # =========================================================
-# НАСТРОЙКИ ПО УМОЛЧАНИЮ ДЛЯ НОВЫХ СЕССИЙ РАССЫЛКИ
+# СТРОКОВЫЕ СЕССИИ (Pyrogram string session)
+# Ключ = имя, под которым аккаунт будет виден в боте
+# =========================================================
+SESSION_STRINGS = {
+    "my_session": (
+        "AgGBqwMANJfdRCzQThfulU4SzdmwmjUfB0Gcb6nzghFr8wyfL5c0IQXCW2BOYeIv9n-"
+        "Off4wwiv6SdYUKd3IFq7qzevThznk5VD0YIQKDmBFAuiUHyGE3wHLmJnPC0ZHFUvHvU"
+        "HhdDgrxQ1rCvu9a5hAlvzwvfeTxMNK3iO_B2nO5u9h5Zjv7GFgRH8_xWpTnMhfzB1KO3"
+        "ikfRJoR9lr0ip0kD1SossWF38GSlEmb4yqFKLVEV_tW2j00uuU-denCpoZMcHwKE_zL7-"
+        "px_1Fklbr_JGfVzExepzG5B2tDf4anLWdFnR_KxWAIwJQCbl-DbkTBMy_LK25HJ2swXa"
+        "Z7OSo53AneQAAAAGR4ClxAA"
+    ),
+}
+
+# =========================================================
+# НАСТРОЙКИ ПО УМОЛЧАНИЮ
 # =========================================================
 DEFAULTS = {
     "interval_sec": 20,
@@ -33,5 +48,5 @@ SETTINGS = {
     "log_level": "INFO",
     "log_file": "logs/bot.log",
     "db_path": "manager.db",
-    "sessions_dir": ".",   # сессии лежат в корне репозитория, рядом с main.py
+    "sessions_dir": ".",
 }
