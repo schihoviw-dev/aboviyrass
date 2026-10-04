@@ -1,37 +1,36 @@
 # -*- coding: utf-8 -*-
 """
 Конфиг менеджера рассылок Telegram.
-Просто редактируй значения ниже и сохраняй файл.
 """
 
 # =========================================================
-# БОТ-МЕНЕДЖЕР (создаёшь через @BotFather)
+# БОТ-МЕНЕДЖЕР
 # =========================================================
 BOT = {
-    "api_id": 25275139,                                  # с my.telegram.org
-    "api_hash": "17da51cd5121cebf33c0ef4b7d6cf03d",                        # с my.telegram.org
-    "bot_token": "8217470990:AAGJEDyNoOYZl49HwYmJX9RT9onsXG6-dWk",       # от @BotFather
-    "owner_id": 6742354289,                              # твой user id от @userinfobot
+    "api_id": 25275139,
+    "api_hash": "17da51cd5121cebf33c0ef4b7d6cf03d",
+    "bot_token": "8217470990:AAGJEDyNoOYZl49HwYmJX9RT9onsXG6-dWk",
+    "owner_id": 6742354289,
 }
 
 # =========================================================
 # НАСТРОЙКИ ПО УМОЛЧАНИЮ ДЛЯ НОВЫХ СЕССИЙ РАССЫЛКИ
 # =========================================================
 DEFAULTS = {
-    "interval_sec": 20,          # пауза между сообщениями
-    "target_delay_sec": 1.5,     # пауза между чатами внутри одного сообщения
-    "copy_mode": True,           # True = копия без "Переслано от", False = forward
-    "loop_forever": True,        # зацикливать рассылку бесконечно
-    "loop_pause_sec": 60,        # пауза между полными проходами
-    "history_limit": 0,          # 0 = тянуть всю историю
-    "live": True,                # ловить новые сообщения параллельно
+    "interval_sec": 20,
+    "target_delay_sec": 1.5,
+    "copy_mode": True,
+    "loop_forever": True,
+    "loop_pause_sec": 60,
+    "history_limit": 0,
+    "live": True,
 }
 
 # =========================================================
 # СИСТЕМНЫЕ НАСТРОЙКИ
 # =========================================================
 SETTINGS = {
-    "log_level": "INFO",                     # DEBUG / INFO / WARNING / ERROR
+    "log_level": "INFO",
     "log_file": "data/logs/bot.log",
     "db_path": "data/manager.db",
     "sessions_dir": "data/sessions",
