@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     targets TEXT NOT NULL,
     interval_sec REAL DEFAULT 20,
     target_delay_sec REAL DEFAULT 1.5,
-    copy_mode INTEGER DEFAULT 1,
+    copy_mode INTEGER DEFAULT 0,
     loop_forever INTEGER DEFAULT 1,
     loop_pause_sec REAL DEFAULT 60,
     history_limit INTEGER DEFAULT 0,
@@ -325,7 +325,6 @@ class BroadcastTask:
                 f"[S{self.sid}:{self.name}] Вход: {me.first_name} (@{me.username})"
             )
 
-            # ============== ПРОГРЕВ ДИАЛОГОВ ==============
             try:
                 count = 0
                 async for _d in self.client.get_dialogs():
@@ -335,7 +334,6 @@ class BroadcastTask:
                 )
             except Exception as e:
                 self.log.warning(f"[S{self.sid}:{self.name}] Прогрев диалогов: {e}")
-            # ==============================================
 
             for src in self.sources_raw:
                 try:
@@ -415,11 +413,20 @@ class BroadcastTask:
 
             albums: Dict[str, List[Message]] = {}
             singles: List[Message] = []
+            skipped = 0
             for m in msgs:
+                if getattr(m, "service", None):
+                    skipped += 1
+                    continue
                 if m.media_group_id is None:
                     singles.append(m)
                 else:
                     albums.setdefault(str(m.media_group_id), []).append(m)
+            if skipped:
+                self.log.info(
+                    f"[S{self.sid}:{self.name}] из {src_id}: пропущено "
+                    f"{skipped} сервисных сообщений"
+                )
             album_batches = [sorted(v, key=lambda x: x.id) for v in albums.values()]
             all_batches.extend([[m] for m in singles] + album_batches)
             self.log.info(f"[S{self.sid}:{self.name}] Из {src_id}: {len(msgs)} сообщений")
@@ -503,21 +510,42 @@ class BroadcastTask:
         await asyncio.sleep(self.interval_sec)
 
     async def _deliver(self, msgs: List[Message], target: int):
-        if len(msgs) == 1:
-            m = msgs[0]
-            if self.copy_mode:
-                await m.copy(chat_id=target, parse_mode=ParseMode.DISABLED)
-            else:
-                await m.forward(chat_id=target)
+        # Отсеиваем сервисные — их нельзя ни скопировать, ни переслать
+        real_msgs = [m for m in msgs if not getattr(m, "service", None)]
+        if not real_msgs:
+            self.log.info(
+                f"[S{self.sid}:{self.name}] пропуск сервисного id={msgs[0].id}"
+            )
             return
 
+        if len(real_msgs) == 1:
+            m = real_msgs[0]
+            try:
+                if self.copy_mode:
+                    await m.copy(chat_id=target, parse_mode=ParseMode.DISABLED)
+                else:
+                    await m.forward(chat_id=target)
+            except Exception as e:
+                self.log.warning(
+                    f"[S{self.sid}:{self.name}] id={m.id} не отправлено: {e}"
+                )
+            return
+
+        # Альбом (несколько сообщений)
         if not self.copy_mode:
-            for m in msgs:
-                await m.forward(chat_id=target)
+            # При forward каждый msg пересылаем отдельно — Telegram сам склеит в альбом
+            for m in real_msgs:
+                try:
+                    await m.forward(chat_id=target)
+                except Exception as e:
+                    self.log.warning(
+                        f"[S{self.sid}:{self.name}] fwd id={m.id}: {e}"
+                    )
             return
 
+        # copy_mode = True — собираем media group
         media = []
-        for m in msgs:
+        for m in real_msgs:
             cap = m.caption.markdown if m.caption else None
             if m.photo:
                 media.append(InputMediaPhoto(media=m.photo.file_id, caption=cap))
@@ -530,14 +558,26 @@ class BroadcastTask:
             elif m.document:
                 media.append(InputMediaDocument(media=m.document.file_id, caption=cap))
             else:
-                await m.copy(chat_id=target, parse_mode=ParseMode.DISABLED)
+                try:
+                    await m.copy(chat_id=target, parse_mode=ParseMode.DISABLED)
+                except Exception as e:
+                    self.log.warning(
+                        f"[S{self.sid}:{self.name}] copy id={m.id}: {e}"
+                    )
         if media:
             try:
                 await self.client.send_media_group(chat_id=target, media=media)
             except Exception as e:
-                self.log.warning(f"[S{self.sid}:{self.name}] media_group fail: {e}")
-                for m in msgs:
-                    await m.copy(chat_id=target, parse_mode=ParseMode.DISABLED)
+                self.log.warning(
+                    f"[S{self.sid}:{self.name}] media_group fail: {e}"
+                )
+                for m in real_msgs:
+                    try:
+                        await m.forward(chat_id=target)
+                    except Exception as e2:
+                        self.log.warning(
+                            f"[S{self.sid}:{self.name}] fwd id={m.id}: {e2}"
+                        )
 
 
 # =========================================================
@@ -689,8 +729,8 @@ class ManagerBot:
                         f"⏱ interval: {row['interval_sec']}s | "
                         f"target_delay: {row['target_delay_sec']}s\n"
                         f"🔁 loop: {bool(row['loop_forever'])} | "
-                        f"copy: {bool(row['copy_mode'])} | "
-                        f"live: {bool(row['live'])} | "
+                        f"📋 copy: {bool(row['copy_mode'])} | "
+                        f"🎞 live: {bool(row['live'])} | "
                         f"hist_limit: {row['history_limit']}"
                     )
                     buttons = []
