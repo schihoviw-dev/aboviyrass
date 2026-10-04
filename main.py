@@ -201,12 +201,6 @@ async def resolve_peer(client: Client, link: str):
 
 
 async def resolve_target_with_fallback(client: Client, link: str, log: logging.Logger, tag: str):
-    """
-    Пытается получить чат по ссылке.
-    1) resolve_peer
-    2) get_chat
-    3) если PeerIdInvalid / KeyError — join_chat (для публичных всегда работает)
-    """
     try:
         peer = await resolve_peer(client, link)
         try:
@@ -332,10 +326,6 @@ class BroadcastTask:
             )
 
             # ============== ПРОГРЕВ ДИАЛОГОВ ==============
-            # Заставляем Telegram прислать список всех чатов,
-            # чтобы Pyrogram записал их ID в кэш сессии.
-            # Без этого даже резолв @username может падать
-            # с Peer id invalid.
             try:
                 count = 0
                 async for _d in self.client.get_dialogs():
@@ -347,7 +337,6 @@ class BroadcastTask:
                 self.log.warning(f"[S{self.sid}:{self.name}] Прогрев диалогов: {e}")
             # ==============================================
 
-            # ---------- источники ----------
             for src in self.sources_raw:
                 try:
                     chat = await resolve_target_with_fallback(
@@ -364,7 +353,6 @@ class BroadcastTask:
                 except Exception as e:
                     self.log.warning(f"[S{self.sid}:{self.name}] Источник {src}: {e}")
 
-            # ---------- цели ----------
             for t in self.targets_raw:
                 try:
                     chat = await resolve_target_with_fallback(
@@ -910,7 +898,9 @@ class ManagerBot:
                 await self.db.update_session(sid, sources=json.dumps(items))
                 self.fsm.pop("state", None)
                 await m.reply(f"✅ Источники обновлены ({len(items)}).")
-                return            if state.startswith("edit_tgt:"):
+                return
+
+            if state.startswith("edit_tgt:"):
                 sid = int(state.split(":")[1])
                 items = parse_targets_line(text)
                 if not items:
