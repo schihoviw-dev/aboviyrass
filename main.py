@@ -81,13 +81,10 @@ def setup_logger(cfg: dict) -> logging.Logger:
 # SESSION SCANNER
 # =========================================================
 def list_sessions(sessions_dir: Path, session_strings: Dict[str, str]) -> List[str]:
-    """Доступные аккаунты: сначала строковые, потом .session файлы."""
     out: List[str] = []
-
     for name in session_strings.keys():
         if name and name not in out:
             out.append(name)
-
     if sessions_dir.exists():
         for p in sorted(sessions_dir.glob("*.session")):
             if p.stem == "manager_bot":
@@ -95,7 +92,6 @@ def list_sessions(sessions_dir: Path, session_strings: Dict[str, str]) -> List[s
             if p.stem in out:
                 continue
             out.append(p.stem)
-
     return out
 
 
@@ -204,6 +200,25 @@ async def resolve_peer(client: Client, link: str):
         return link
 
 
+async def resolve_target_with_fallback(client: Client, link: str, log: logging.Logger, tag: str):
+    """
+    Пытается получить чат по ссылке.
+    1) resolve_peer
+    2) get_chat
+    3) если PeerIdInvalid / KeyError — join_chat (для публичных всегда работает)
+    """
+    try:
+        peer = await resolve_peer(client, link)
+        try:
+            return await client.get_chat(peer)
+        except Exception as e:
+            log.warning(f"{tag} get_chat('{peer}') упал ({e}), пробую join_chat")
+            return await client.join_chat(link)
+    except Exception as e:
+        log.warning(f"{tag} join_chat('{link}') не удался: {e}")
+        raise
+
+
 # =========================================================
 # ALBUM COLLECTOR
 # =========================================================
@@ -287,13 +302,9 @@ class BroadcastTask:
                 pass
 
     def _make_client(self) -> Client:
-        """Строковая сессия в приоритете, иначе — .session файл."""
         session_string = self.app.cfg.get("session_strings", {}).get(self.session_name)
-
         if session_string:
-            self.log.info(
-                f"[S{self.sid}:{self.name}] string session: {self.session_name}"
-            )
+            self.log.info(f"[S{self.sid}:{self.name}] string session: {self.session_name}")
             return Client(
                 name=self.session_name,
                 api_id=self.app.cfg["bot"]["api_id"],
@@ -302,9 +313,7 @@ class BroadcastTask:
                 in_memory=True,
             )
         else:
-            self.log.info(
-                f"[S{self.sid}:{self.name}] файл {self.session_name}.session"
-            )
+            self.log.info(f"[S{self.sid}:{self.name}] файл {self.session_name}.session")
             return Client(
                 name=self.session_name,
                 api_id=self.app.cfg["bot"]["api_id"],
@@ -322,26 +331,50 @@ class BroadcastTask:
                 f"[S{self.sid}:{self.name}] Вход: {me.first_name} (@{me.username})"
             )
 
+            # ============== ПРОГРЕВ ДИАЛОГОВ ==============
+            # Заставляем Telegram прислать список всех чатов,
+            # чтобы Pyrogram записал их ID в кэш сессии.
+            # Без этого даже резолв @username может падать
+            # с Peer id invalid.
+            try:
+                count = 0
+                async for _d in self.client.get_dialogs():
+                    count += 1
+                self.log.info(
+                    f"[S{self.sid}:{self.name}] Прогрев: обработано {count} диалогов"
+                )
+            except Exception as e:
+                self.log.warning(f"[S{self.sid}:{self.name}] Прогрев диалогов: {e}")
+            # ==============================================
+
+            # ---------- источники ----------
             for src in self.sources_raw:
                 try:
-                    peer = await resolve_peer(self.client, src)
-                    chat = await self.client.get_chat(peer)
+                    chat = await resolve_target_with_fallback(
+                        self.client, src, self.log,
+                        f"[S{self.sid}:{self.name}] Источник"
+                    )
                     self.source_ids.append(chat.id)
                     self._albums[chat.id] = AlbumCollector(1.5)
                     self._albums[chat.id].set_flush(self._enqueue_batch)
                     self.log.info(
-                        f"[S{self.sid}:{self.name}] Источник OK: {chat.title} ({chat.id})"
+                        f"[S{self.sid}:{self.name}] Источник OK: "
+                        f"{chat.title} ({chat.id})"
                     )
                 except Exception as e:
                     self.log.warning(f"[S{self.sid}:{self.name}] Источник {src}: {e}")
 
+            # ---------- цели ----------
             for t in self.targets_raw:
                 try:
-                    peer = await resolve_peer(self.client, t)
-                    chat = await self.client.get_chat(peer)
+                    chat = await resolve_target_with_fallback(
+                        self.client, t, self.log,
+                        f"[S{self.sid}:{self.name}] Цель"
+                    )
                     self.target_ids.append(chat.id)
                     self.log.info(
-                        f"[S{self.sid}:{self.name}] Цель OK: {chat.title} ({chat.id})"
+                        f"[S{self.sid}:{self.name}] Цель OK: "
+                        f"{chat.title} ({chat.id})"
                     )
                 except Exception as e:
                     self.log.warning(f"[S{self.sid}:{self.name}] Цель {t}: {e}")
@@ -572,10 +605,7 @@ class ManagerBot:
             sessions = list_sessions(self.sessions_dir, self.session_strings)
             text = "📱 **Доступные аккаунты**\n\n"
             if not sessions:
-                text += (
-                    "❌ Пусто.\n\n"
-                    "Добавь строку в `SESSION_STRINGS` в `config.py`."
-                )
+                text += "❌ Пусто. Добавь строку в `SESSION_STRINGS` в `config.py`."
             else:
                 for i, name in enumerate(sessions, 1):
                     src = "🔑 string" if name in self.session_strings else "📄 file"
@@ -606,10 +636,7 @@ class ManagerBot:
         async def cmd_new(_, m: Message):
             sessions = list_sessions(self.sessions_dir, self.session_strings)
             if not sessions:
-                await m.reply(
-                    "❌ Нет доступных аккаунтов.\n"
-                    "Добавь строку в `SESSION_STRINGS` в `config.py`."
-                )
+                await m.reply("❌ Нет аккаунтов. Добавь строку в `SESSION_STRINGS`.")
                 return
             self.fsm["state"] = "ses:name"
             await m.reply("Введи название сессии рассылки:")
@@ -883,9 +910,7 @@ class ManagerBot:
                 await self.db.update_session(sid, sources=json.dumps(items))
                 self.fsm.pop("state", None)
                 await m.reply(f"✅ Источники обновлены ({len(items)}).")
-                return
-
-            if state.startswith("edit_tgt:"):
+                return            if state.startswith("edit_tgt:"):
                 sid = int(state.split(":")[1])
                 items = parse_targets_line(text)
                 if not items:
@@ -916,19 +941,13 @@ class ManagerBot:
         row = await self.db.get_session(sid)
         if not row:
             return
-
         session_name = row["session_name"]
-        # Проверка: есть ли строковая сессия или файл
         has_string = session_name in self.session_strings
         has_file = (self.sessions_dir / f"{session_name}.session").exists()
-
         if not has_string and not has_file:
-            self.log.error(
-                f"[S{sid}] Ни string, ни .session файла для '{session_name}'"
-            )
+            self.log.error(f"[S{sid}] нет '{session_name}'")
             await self.db.update_session(sid, state="stopped")
             return
-
         task = BroadcastTask(row, self)
         self.running[sid] = task
         await self.db.update_session(sid, state="running")
