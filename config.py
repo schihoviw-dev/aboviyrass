@@ -8,8 +8,8 @@
 # БОТ-МЕНЕДЖЕР (создаёшь через @BotFather)
 # =========================================================
 BOT = {
-    "api_id": 1234567,                                  # с my.telegram.org
-    "api_hash": "your_api_hash",                        # с my.telegram.org
+    "api_id": 25275139,                                  # с my.telegram.org
+    "api_hash": "17da51cd5121cebf33c0ef4b7d6cf03d",                        # с my.telegram.org
     "bot_token": "8217470990:AAGJEDyNoOYZl49HwYmJX9RT9onsXG6-dWk",       # от @BotFather
     "owner_id": 123456789,                              # твой user id от @userinfobot
 }
