@@ -31,7 +31,7 @@ DEFAULTS = {
 # =========================================================
 SETTINGS = {
     "log_level": "INFO",
-    "log_file": "data/logs/bot.log",
-    "db_path": "data/manager.db",
-    "sessions_dir": "data/sessions",
+    "log_file": "logs/bot.log",
+    "db_path": "manager.db",
+    "sessions_dir": ".",   # сессии лежат в корне репозитория, рядом с main.py
 }
