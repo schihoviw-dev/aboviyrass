@@ -125,7 +125,6 @@ class DB:
         if self.conn:
             await self.conn.close()
 
-    # ---------- ACCOUNTS ----------
     async def add_account(self, name, api_id, api_hash, phone, session_name) -> int:
         cur = await self.conn.execute(
             "INSERT INTO accounts (name, api_id, api_hash, phone, session_name) "
@@ -147,7 +146,6 @@ class DB:
         await self.conn.execute("DELETE FROM accounts WHERE id=?", (acc_id,))
         await self.conn.commit()
 
-    # ---------- SESSIONS ----------
     async def add_session(self, name, account_id, sources: list, targets: list, **kw) -> int:
         d = _defaults_dict()
         d.update({k: v for k, v in kw.items() if v is not None})
@@ -192,7 +190,6 @@ class DB:
 # HELPERS
 # =========================================================
 def parse_targets_line(text: str) -> List[str]:
-    """'a, b, c' или 'a b c' -> ['a','b','c']"""
     if not text:
         return []
     text = text.replace(",", " ")
@@ -318,7 +315,6 @@ class BroadcastTask:
             me = await self.client.get_me()
             self.log.info(f"[S{self.sid}:{self.name}] Вход: {me.first_name} (@{me.username})")
 
-            # resolve sources
             for src in self.sources_raw:
                 try:
                     peer = await resolve_peer(self.client, src)
@@ -332,7 +328,6 @@ class BroadcastTask:
                 except Exception as e:
                     self.log.warning(f"[S{self.sid}:{self.name}] Источник {src}: {e}")
 
-            # resolve targets
             for t in self.targets_raw:
                 try:
                     peer = await resolve_peer(self.client, t)
@@ -349,7 +344,6 @@ class BroadcastTask:
                 await self.app.set_session_state(self.sid, "stopped")
                 return
 
-            # handler
             @self.client.on_message(group=100)
             async def _handler(_client, message: Message):
                 if not message.chat or message.chat.id not in self.source_ids:
@@ -546,7 +540,6 @@ class ManagerBot:
     async def set_session_state(self, sid: int, state: str):
         await self.db.update_session(sid, state=state)
 
-    # ---------- handlers ----------
     def _register_handlers(self):
         app = self.app
         owner_filter = filters.private & filters.user(self.owner_id)
@@ -555,7 +548,7 @@ class ManagerBot:
         async def cmd_start(_, m: Message):
             self.fsm.pop("state", None)
             await m.reply(
-                "👋 **Менеджер рассылок**\n\n"
+                "👋 Менеджер рассылок\n\n"
                 "• /accounts — аккаунты (от чьего имени шлём)\n"
                 "• /sessions — сессии рассылки\n"
                 "• /new — создать сессию\n"
@@ -564,7 +557,6 @@ class ManagerBot:
 
         @app.on_message(filters.command("cancel") & owner_filter)
         async def cmd_cancel(_, m: Message):
-            # чистим временный клиент, если был
             cli: Optional[Client] = self.fsm.pop("_cli", None)
             if cli:
                 try:
@@ -574,33 +566,31 @@ class ManagerBot:
             self.fsm.pop("state", None)
             await m.reply("Отменено.")
 
-        # ====== ACCOUNTS ======
         @app.on_message(filters.command("accounts") & owner_filter)
         async def cmd_accounts(_, m: Message):
             rows = await self.db.list_accounts()
-            text = "📱 **Аккаунты**\n\n"
+            text = "📱 Аккаунты\n\n"
             if not rows:
                 text += "Пока нет ни одного аккаунта."
             else:
                 for r in rows:
-                    text += f"`#{r['id']}` **{r['name']}** — `{r['phone']}`\n"
+                    text += f"#{r['id']} {r['name']} — {r['phone']}\n"
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Добавить аккаунт", callback_data="acc:add")],
                 [InlineKeyboardButton("🗑 Удалить", callback_data="acc:del_menu")],
             ])
             await m.reply(text, reply_markup=kb)
 
-        # ====== SESSIONS ======
         @app.on_message(filters.command("sessions") & owner_filter)
         async def cmd_sessions(_, m: Message):
             rows = await self.db.list_sessions()
-            text = "📋 **Сессии рассылки**\n\n"
+            text = "📋 Сессии рассылки\n\n"
             if not rows:
                 text += "Пока нет ни одной сессии."
             else:
                 for r in rows:
                     emoji = "🟢" if r["state"] == "running" else "⚪️"
-                    text += f"{emoji} `#{r['id']}` **{r['name']}**\n"
+                    text += f"{emoji} #{r['id']} {r['name']}\n"
             buttons = []
             for r in rows:
                 buttons.append([InlineKeyboardButton(
@@ -615,19 +605,15 @@ class ManagerBot:
                 await m.reply("Сначала добавь аккаунт: /accounts")
                 return
             self.fsm["state"] = "ses:name"
-            await m.reply("Введи **название сессии** рассылки:")
+            await m.reply("Введи название сессии рассылки:")
 
-        # ====== CALLBACKS ======
         @app.on_callback_query(filters.user(self.owner_id))
         async def on_cb(_, cq: CallbackQuery):
             data = cq.data or ""
             try:
-                # ---------- ACC ----------
                 if data == "acc:add":
                     self.fsm["state"] = "acc:name"
-                    await cq.message.edit_text(
-                        "Введи **имя аккаунта** (произвольное, например `main`):"
-                    )
+                    await cq.message.edit_text("Введи имя аккаунта (произвольное, например main):")
                     await cq.answer()
                     return
 
@@ -656,25 +642,24 @@ class ManagerBot:
                     await cq.answer()
                     return
 
-                # ---------- SES ----------
                 if data == "ses:add":
                     if not await self.db.list_accounts():
                         await cq.answer("Сначала добавь аккаунт", show_alert=True)
                         return
                     self.fsm["state"] = "ses:name"
-                    await cq.message.edit_text("Введи **название сессии** рассылки:")
+                    await cq.message.edit_text("Введи название сессии рассылки:")
                     await cq.answer()
                     return
 
                 if data == "ses:list":
                     rows = await self.db.list_sessions()
-                    text = "📋 **Сессии рассылки**\n\n"
+                    text = "📋 Сессии рассылки\n\n"
                     if not rows:
                         text += "Пока нет ни одной сессии."
                     else:
                         for r in rows:
                             emoji = "🟢" if r["state"] == "running" else "⚪️"
-                            text += f"{emoji} `#{r['id']}` **{r['name']}**\n"
+                            text += f"{emoji} #{r['id']} {r['name']}\n"
                     buttons = []
                     for r in rows:
                         buttons.append([InlineKeyboardButton(
@@ -701,22 +686,22 @@ class ManagerBot:
                     targets = json.loads(row["targets"])
                     state = row["state"]
                     txt = (
-                        f"⚙️ **Сессия #{row['id']}** — `{row['name']}`\n"
-                        f"Аккаунт: **{acc['name'] if acc else '?'}** "
+                        f"⚙️ Сессия #{row['id']} — {row['name']}\n"
+                        f"Аккаунт: {acc['name'] if acc else '?'} "
                         f"({acc['phone'] if acc else '?'})\n"
-                        f"Статус: **{state}**\n\n"
+                        f"Статус: {state}\n\n"
                         f"📥 Источники ({len(sources)}):\n"
-                        + "\n".join(f"  • `{s}`" for s in sources)
+                        + "\n".join(f"  • {s}" for s in sources)
                         + "\n\n"
                         f"📤 Цели ({len(targets)}):\n"
-                        + "\n".join(f"  • `{t}`" for t in targets)
+                        + "\n".join(f"  • {t}" for t in targets)
                         + "\n\n"
-                        f"⏱ interval: `{row['interval_sec']}s` | "
-                        f"target_delay: `{row['target_delay_sec']}s`\n"
-                        f"🔁 loop: `{bool(row['loop_forever'])}` | "
-                        f"copy: `{bool(row['copy_mode'])}` | "
-                        f"live: `{bool(row['live'])}` | "
-                        f"hist_limit: `{row['history_limit']}`"
+                        f"⏱ interval: {row['interval_sec']}s | "
+                        f"target_delay: {row['target_delay_sec']}s\n"
+                        f"🔁 loop: {bool(row['loop_forever'])} | "
+                        f"copy: {bool(row['copy_mode'])} | "
+                        f"live: {bool(row['live'])} | "
+                        f"hist_limit: {row['history_limit']}"
                     )
                     buttons = []
                     if state == "running":
@@ -789,7 +774,7 @@ class ManagerBot:
                     sid = int(data.split(":")[2])
                     self.fsm["state"] = f"edit_src:{sid}"
                     await cq.message.edit_text(
-                        "Пришли ссылки на **источники** через запятую или пробел.\n"
+                        "Пришли ссылки на источники через запятую или пробел.\n"
                         "Отмена: /cancel"
                     )
                     await cq.answer()
@@ -799,7 +784,7 @@ class ManagerBot:
                     sid = int(data.split(":")[2])
                     self.fsm["state"] = f"edit_tgt:{sid}"
                     await cq.message.edit_text(
-                        "Пришли список **целей** через запятую.\nОтмена: /cancel"
+                        "Пришли список целей через запятую.\nОтмена: /cancel"
                     )
                     await cq.answer()
                     return
@@ -807,9 +792,7 @@ class ManagerBot:
                 if data.startswith("ses:edit_int:"):
                     sid = int(data.split(":")[2])
                     self.fsm["state"] = f"edit_int:{sid}"
-                    await cq.message.edit_text(
-                        "Введи интервал в секундах (например 20):"
-                    )
+                    await cq.message.edit_text("Введи интервал в секундах (например 20):")
                     await cq.answer()
                     return
 
@@ -842,4 +825,275 @@ class ManagerBot:
 
                 if data.startswith("ses:pick_acc:"):
                     acc_id = int(data.split(":")[2])
-                    self.fsm["ses
+                    self.fsm["ses_account_id"] = acc_id
+                    self.fsm["state"] = "ses:sources"
+                    await cq.message.edit_text(
+                        "Пришли источники (откуда пересылать) через запятую или пробел.\n"
+                        "Можно несколько ссылок."
+                    )
+                    await cq.answer()
+                    return
+
+            except Exception as e:
+                self.log.exception(f"callback error: {e}")
+                try:
+                    await cq.answer("Ошибка", show_alert=True)
+                except Exception:
+                    pass
+
+        @app.on_message(filters.text & owner_filter, group=1)
+        async def fsm_handler(_, m: Message):
+            state = self.fsm.get("state")
+            if not state:
+                return
+            text = m.text.strip()
+
+            # ---------- ACC ----------
+            if state == "acc:name":
+                self.fsm["acc_name"] = text
+                self.fsm["state"] = "acc:api_id"
+                await m.reply("Введи api_id (число из my.telegram.org):")
+                return
+
+            if state == "acc:api_id":
+                if not text.isdigit():
+                    await m.reply("api_id должен быть числом. Попробуй снова:")
+                    return
+                self.fsm["acc_api_id"] = int(text)
+                self.fsm["state"] = "acc:api_hash"
+                await m.reply("Введи api_hash:")
+                return
+
+            if state == "acc:api_hash":
+                self.fsm["acc_api_hash"] = text
+                self.fsm["state"] = "acc:phone"
+                await m.reply("Введи номер телефона в формате +79990001122:")
+                return
+
+            if state == "acc:phone":
+                phone = text.replace(" ", "")
+                if not phone.startswith("+"):
+                    await m.reply("Номер должен начинаться с +. Попробуй снова:")
+                    return
+                name = self.fsm["acc_name"]
+                api_id = self.fsm["acc_api_id"]
+                api_hash = self.fsm["acc_api_hash"]
+                session_name = f"acc_{name}_{int(asyncio.get_event_loop().time())}"
+
+                await m.reply(
+                    "📲 Сейчас придёт код от Telegram. "
+                    "Введи код БЕЗ пробелов, например 12345."
+                )
+                try:
+                    cli = Client(
+                        name=session_name,
+                        api_id=api_id, api_hash=api_hash,
+                        phone_number=phone,
+                        workdir=str(self.sessions_dir),
+                    )
+                    await cli.connect()
+                    sent = await cli.send_code(phone)
+                    self.fsm["state"] = "acc:code"
+                    self.fsm["_cli"] = cli
+                    self.fsm["_phone"] = phone
+                    self.fsm["_phone_code_hash"] = sent.phone_code_hash
+                    self.fsm["_session_name"] = session_name
+                    await m.reply("Введи код:")
+                except Exception as e:
+                    self.log.exception("send_code error")
+                    await m.reply(f"Ошибка: {e}")
+                    self.fsm.pop("state", None)
+                return
+
+            if state == "acc:code":
+                cli: Client = self.fsm["_cli"]
+                phone = self.fsm["_phone"]
+                phone_code_hash = self.fsm["_phone_code_hash"]
+                try:
+                    await cli.sign_in(phone, phone_code_hash, text)
+                except SessionPasswordNeeded:
+                    self.fsm["state"] = "acc:2fa"
+                    await m.reply("Введи пароль 2FA:")
+                    return
+                except (PhoneCodeInvalid, PhoneCodeExpired) as e:
+                    await m.reply(f"Код неверный/просрочен: {e}. Введи заново или /cancel")
+                    return
+                except Exception as e:
+                    self.log.exception("sign_in error")
+                    await m.reply(f"Ошибка входа: {e}")
+                    self.fsm.pop("state", None)
+                    return
+                await self._save_account(cli, m)
+                return
+
+            if state == "acc:2fa":
+                cli: Client = self.fsm["_cli"]
+                try:
+                    await cli.check_password(text)
+                except Exception as e:
+                    await m.reply(f"Неверный пароль: {e}")
+                    return
+                await self._save_account(cli, m)
+                return
+
+            # ---------- SES ----------
+            if state == "ses:name":
+                self.fsm["ses_name"] = text
+                rows = await self.db.list_accounts()
+                buttons = [
+                    [InlineKeyboardButton(
+                        f"{r['name']} ({r['phone']})",
+                        callback_data=f"ses:pick_acc:{r['id']}"
+                    )] for r in rows
+                ]
+                self.fsm["state"] = "ses:pick_acc"
+                await m.reply("Выбери аккаунт для рассылки:",
+                              reply_markup=InlineKeyboardMarkup(buttons))
+                return
+
+            if state == "ses:sources":
+                items = parse_targets_line(text)
+                if not items:
+                    await m.reply("Пусто. Попробуй снова или /cancel")
+                    return
+                self.fsm["ses_sources"] = items
+                self.fsm["state"] = "ses:targets"
+                await m.reply(f"Принято {len(items)} источников. Теперь цели через запятую:")
+                return
+
+            if state == "ses:targets":
+                items = parse_targets_line(text)
+                if not items:
+                    await m.reply("Пусто. Попробуй снова или /cancel")
+                    return
+                acc_id = self.fsm["ses_account_id"]
+                name = self.fsm["ses_name"]
+                sources = self.fsm["ses_sources"]
+                sid = await self.db.add_session(name, acc_id, sources, items)
+                self.fsm.pop("state", None)
+                await m.reply(
+                    f"✅ Сессия #{sid} {name} создана.\n"
+                    f"Запустить: /sessions → выбери её."
+                )
+                return
+
+            if state.startswith("edit_src:"):
+                sid = int(state.split(":")[1])
+                items = parse_targets_line(text)
+                if not items:
+                    await m.reply("Пусто. /cancel")
+                    return
+                await self.db.update_session(sid, sources=json.dumps(items))
+                self.fsm.pop("state", None)
+                await m.reply(f"✅ Источники обновлены ({len(items)}).")
+                return
+
+            if state.startswith("edit_tgt:"):
+                sid = int(state.split(":")[1])
+                items = parse_targets_line(text)
+                if not items:
+                    await m.reply("Пусто. /cancel")
+                    return
+                await self.db.update_session(sid, targets=json.dumps(items))
+                self.fsm.pop("state", None)
+                await m.reply(f"✅ Цели обновлены ({len(items)}).")
+                return
+
+            if state.startswith("edit_int:"):
+                sid = int(state.split(":")[1])
+                try:
+                    val = float(text)
+                    if val <= 0:
+                        raise ValueError
+                except ValueError:
+                    await m.reply("Введи положительное число:")
+                    return
+                await self.db.update_session(sid, interval_sec=val)
+                self.fsm.pop("state", None)
+                await m.reply(f"✅ Интервал = {val}s")
+                return
+
+    async def _save_account(self, cli: Client, m: Message):
+        name = self.fsm["acc_name"]
+        api_id = self.fsm["acc_api_id"]
+        api_hash = self.fsm["acc_api_hash"]
+        phone = self.fsm["_phone"]
+        session_name = self.fsm["_session_name"]
+
+        await cli.disconnect()
+
+        try:
+            await self.db.add_account(name, api_id, api_hash, phone, session_name)
+        except Exception as e:
+            await m.reply(f"❌ Ошибка сохранения: {e}")
+            self.fsm.pop("state", None)
+            return
+
+        self.fsm.pop("state", None)
+        await m.reply(
+            f"✅ Аккаунт {name} добавлен.\nТеперь можешь создавать сессии: /new"
+        )
+
+    async def _start_session(self, sid: int):
+        if sid in self.running:
+            return
+        row = await self.db.get_session(sid)
+        if not row:
+            return
+        acc = await self.db.get_account(row["account_id"])
+        if not acc:
+            return
+        task = BroadcastTask(row, acc, self)
+        self.running[sid] = task
+        await self.db.update_session(sid, state="running")
+        await task.start()
+
+    async def _stop_session(self, sid: int):
+        task = self.running.pop(sid, None)
+        if task:
+            await task.stop()
+        await self.db.update_session(sid, state="stopped")
+
+    async def run(self):
+        await self.app.start()
+        me = await self.app.get_me()
+        self.log.info(f"Бот запущен: @{me.username}")
+
+        rows = await self.db.list_sessions()
+        for r in rows:
+            if r["state"] == "running":
+                self.log.info(f"Возобновляю сессию #{r['id']} {r['name']}")
+                await self._start_session(r["id"])
+
+        await idle()
+
+    async def stop(self):
+        for sid, task in list(self.running.items()):
+            await task.stop()
+        await self.app.stop()
+
+
+# =========================================================
+# MAIN
+# =========================================================
+async def main():
+    cfg = load_config()
+    apply_defaults(cfg["defaults"])
+    log = setup_logger(cfg)
+
+    db = DB(cfg["settings"]["db_path"])
+    await db.init()
+
+    bot = ManagerBot(cfg, db, log)
+    try:
+        await bot.run()
+    finally:
+        await bot.stop()
+        await db.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nОстановлено.")
