@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Менеджер рассылок Telegram.
-Управление через бота-менеджера: аккаунты, сессии рассылки,
-источники и цели. Всё хранится в SQLite и переживает рестарт.
+Аккаунты берутся из готовых .session файлов в data/sessions/.
+Никакого добавления аккаунтов через бота — просто закинь файлы.
 """
 
 import asyncio
@@ -17,8 +17,7 @@ import aiosqlite
 from pyrogram import Client, filters, idle
 from pyrogram.errors import (
     FloodWait, PeerIdInvalid, ChatWriteForbidden,
-    UserBannedInChannel, ChannelPrivate, SessionPasswordNeeded,
-    PhoneCodeInvalid, PhoneCodeExpired,
+    UserBannedInChannel, ChannelPrivate,
 )
 from pyrogram.types import (
     Message, CallbackQuery,
@@ -78,22 +77,28 @@ def setup_logger(cfg: dict) -> logging.Logger:
 
 
 # =========================================================
+# SESSION SCANNER
+# =========================================================
+def list_sessions(sessions_dir: Path) -> List[str]:
+    """Возвращает список имён .session файлов (без расширения)."""
+    if not sessions_dir.exists():
+        return []
+    out = []
+    for p in sorted(sessions_dir.glob("*.session")):
+        if p.stem == "manager_bot":
+            continue  # сессия самого бота-менеджера
+        out.append(p.stem)
+    return out
+
+
+# =========================================================
 # DB
 # =========================================================
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL,
-    api_id INTEGER NOT NULL,
-    api_hash TEXT NOT NULL,
-    phone TEXT NOT NULL,
-    session_name TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
-    account_id INTEGER NOT NULL,
+    session_name TEXT NOT NULL,
     sources TEXT NOT NULL,
     targets TEXT NOT NULL,
     interval_sec REAL DEFAULT 20,
@@ -103,8 +108,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     loop_pause_sec REAL DEFAULT 60,
     history_limit INTEGER DEFAULT 0,
     live INTEGER DEFAULT 1,
-    state TEXT DEFAULT 'stopped',
-    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+    state TEXT DEFAULT 'stopped'
 );
 """
 
@@ -125,38 +129,17 @@ class DB:
         if self.conn:
             await self.conn.close()
 
-    async def add_account(self, name, api_id, api_hash, phone, session_name) -> int:
-        cur = await self.conn.execute(
-            "INSERT INTO accounts (name, api_id, api_hash, phone, session_name) "
-            "VALUES (?,?,?,?,?)",
-            (name, api_id, api_hash, phone, session_name),
-        )
-        await self.conn.commit()
-        return cur.lastrowid
-
-    async def list_accounts(self) -> List[aiosqlite.Row]:
-        cur = await self.conn.execute("SELECT * FROM accounts ORDER BY id")
-        return await cur.fetchall()
-
-    async def get_account(self, acc_id: int):
-        cur = await self.conn.execute("SELECT * FROM accounts WHERE id=?", (acc_id,))
-        return await cur.fetchone()
-
-    async def delete_account(self, acc_id: int):
-        await self.conn.execute("DELETE FROM accounts WHERE id=?", (acc_id,))
-        await self.conn.commit()
-
-    async def add_session(self, name, account_id, sources: list, targets: list, **kw) -> int:
+    async def add_session(self, name, session_name, sources, targets, **kw) -> int:
         d = _defaults_dict()
         d.update({k: v for k, v in kw.items() if v is not None})
         cur = await self.conn.execute(
             """INSERT INTO sessions
-               (name, account_id, sources, targets,
+               (name, session_name, sources, targets,
                 interval_sec, target_delay_sec, copy_mode,
                 loop_forever, loop_pause_sec, history_limit, live)
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                name, account_id, json.dumps(sources), json.dumps(targets),
+                name, session_name, json.dumps(sources), json.dumps(targets),
                 d["interval_sec"], d["target_delay_sec"], int(d["copy_mode"]),
                 int(d["loop_forever"]), d["loop_pause_sec"],
                 d["history_limit"], int(d["live"]),
@@ -253,16 +236,10 @@ class AlbumCollector:
 # BROADCAST TASK
 # =========================================================
 class BroadcastTask:
-    def __init__(self, session_row, account_row, app: "ManagerBot"):
+    def __init__(self, session_row, app: "ManagerBot"):
         self.sid = session_row["id"]
         self.name = session_row["name"]
-        self.account_cfg = {
-            "name": account_row["name"],
-            "api_id": account_row["api_id"],
-            "api_hash": account_row["api_hash"],
-            "phone": account_row["phone"],
-            "session_name": account_row["session_name"],
-        }
+        self.session_name = session_row["session_name"]
         self.sources_raw = json.loads(session_row["sources"])
         self.targets_raw = json.loads(session_row["targets"])
         self.interval_sec = float(session_row["interval_sec"])
@@ -304,16 +281,17 @@ class BroadcastTask:
     async def _run(self):
         try:
             self.client = Client(
-                name=self.account_cfg["session_name"],
-                api_id=self.account_cfg["api_id"],
-                api_hash=self.account_cfg["api_hash"],
-                phone_number=self.account_cfg["phone"],
+                name=self.session_name,
+                api_id=self.app.cfg["bot"]["api_id"],
+                api_hash=self.app.cfg["bot"]["api_hash"],
                 workdir=str(self.app.sessions_dir),
             )
-            self.log.info(f"[S{self.sid}:{self.name}] Старт сессии...")
+            self.log.info(f"[S{self.sid}:{self.name}] Старт сессии {self.session_name}...")
             await self.client.start()
             me = await self.client.get_me()
-            self.log.info(f"[S{self.sid}:{self.name}] Вход: {me.first_name} (@{me.username})")
+            self.log.info(
+                f"[S{self.sid}:{self.name}] Вход: {me.first_name} (@{me.username})"
+            )
 
             for src in self.sources_raw:
                 try:
@@ -373,7 +351,7 @@ class BroadcastTask:
     async def _load_history(self):
         all_batches: List[List[Message]] = []
         for src_id in self.source_ids:
-            self.log.info(f"[S{self.sid}:{self.name}] Читаю историю источника {src_id}")
+            self.log.info(f"[S{self.sid}:{self.name}] Читаю историю {src_id}")
             msgs: List[Message] = []
             collected = 0
             try:
@@ -415,10 +393,9 @@ class BroadcastTask:
                     return
                 await self.queue.put(batch)
             if not self.loop_forever:
-                self.log.info(f"[S{self.sid}:{self.name}] Проход завершён (loop_forever=false)")
                 return
             self.log.info(
-                f"[S{self.sid}:{self.name}] Пауза {self.loop_pause_sec}s до след. прохода"
+                f"[S{self.sid}:{self.name}] Пауза {self.loop_pause_sec}s"
             )
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.loop_pause_sec)
@@ -549,56 +526,35 @@ class ManagerBot:
             self.fsm.pop("state", None)
             await m.reply(
                 "👋 Менеджер рассылок\n\n"
-                "• /accounts — аккаунты (от чьего имени шлём)\n"
+                "Аккаунты берутся из готовых `.session` файлов в папке "
+                "`data/sessions/`. Просто закинь туда файлы — бот их увидит.\n\n"
+                "• /accounts — список найденных сессий\n"
                 "• /sessions — сессии рассылки\n"
-                "• /new — создать сессию\n"
-                "• /resend — выпустить новый код при входе\n"
+                "• /new — создать сессию рассылки\n"
                 "• /cancel — отменить действие\n"
             )
 
         @app.on_message(filters.command("cancel") & owner_filter)
         async def cmd_cancel(_, m: Message):
-            cli: Optional[Client] = self.fsm.pop("_cli", None)
-            if cli:
-                try:
-                    await cli.disconnect()
-                except Exception:
-                    pass
             self.fsm.pop("state", None)
             await m.reply("Отменено.")
 
-        @app.on_message(filters.command("resend") & owner_filter)
-        async def cmd_resend(_, m: Message):
-            cli: Optional[Client] = self.fsm.get("_cli")
-            phone = self.fsm.get("_phone")
-            state = self.fsm.get("state")
-            if not cli or not phone or state not in ("acc:code", "acc:2fa"):
-                await m.reply("Сейчас нет активного ввода кода.")
-                return
-            try:
-                sent = await cli.send_code(phone)
-                self.fsm["_phone_code_hash"] = sent.phone_code_hash
-                self.fsm["state"] = "acc:code"
-                await m.reply("♻️ Новый код отправлен. Введи его:")
-            except FloodWait as fw:
-                await m.reply(f"⏳ Подожди {fw.value}s, потом попробуй снова.")
-            except Exception as e:
-                await m.reply(f"Ошибка: {e}")
-
         @app.on_message(filters.command("accounts") & owner_filter)
         async def cmd_accounts(_, m: Message):
-            rows = await self.db.list_accounts()
-            text = "📱 Аккаунты\n\n"
-            if not rows:
-                text += "Пока нет ни одного аккаунта."
+            sessions = list_sessions(self.sessions_dir)
+            text = "📱 **Готовые сессии** (файлы .session)\n\n"
+            if not sessions:
+                text += (
+                    "❌ Не найдено ни одной сессии.\n\n"
+                    "Закинь файлы `*.session` в папку:\n"
+                    f"`{self.sessions_dir}`"
+                )
             else:
-                for r in rows:
-                    text += f"#{r['id']} {r['name']} — {r['phone']}\n"
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ Добавить аккаунт", callback_data="acc:add")],
-                [InlineKeyboardButton("🗑 Удалить", callback_data="acc:del_menu")],
-            ])
-            await m.reply(text, reply_markup=kb)
+                text += f"Папка: `{self.sessions_dir}`\n\n"
+                for i, name in enumerate(sessions, 1):
+                    text += f"{i}. `{name}`\n"
+                text += "\nЧтобы обновить список, отправь /accounts ещё раз."
+            await m.reply(text)
 
         @app.on_message(filters.command("sessions") & owner_filter)
         async def cmd_sessions(_, m: Message):
@@ -609,19 +565,25 @@ class ManagerBot:
             else:
                 for r in rows:
                     emoji = "🟢" if r["state"] == "running" else "⚪️"
-                    text += f"{emoji} #{r['id']} {r['name']}\n"
+                    text += f"{emoji} #{r['id']} {r['name']} → `{r['session_name']}`\n"
             buttons = []
             for r in rows:
                 buttons.append([InlineKeyboardButton(
                     f"#{r['id']} {r['name']}", callback_data=f"ses:view:{r['id']}"
                 )])
-            buttons.append([InlineKeyboardButton("➕ Создать сессию", callback_data="ses:add")])
+            buttons.append([InlineKeyboardButton(
+                "➕ Создать сессию", callback_data="ses:add"
+            )])
             await m.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
 
         @app.on_message(filters.command("new") & owner_filter)
         async def cmd_new(_, m: Message):
-            if not await self.db.list_accounts():
-                await m.reply("Сначала добавь аккаунт: /accounts")
+            sessions = list_sessions(self.sessions_dir)
+            if not sessions:
+                await m.reply(
+                    "❌ Нет готовых .session файлов.\n"
+                    f"Закинь их в `{self.sessions_dir}` и попробуй снова."
+                )
                 return
             self.fsm["state"] = "ses:name"
             await m.reply("Введи название сессии рассылки:")
@@ -630,40 +592,10 @@ class ManagerBot:
         async def on_cb(_, cq: CallbackQuery):
             data = cq.data or ""
             try:
-                if data == "acc:add":
-                    self.fsm["state"] = "acc:name"
-                    await cq.message.edit_text("Введи имя аккаунта (произвольное, например main):")
-                    await cq.answer()
-                    return
-
-                if data == "acc:del_menu":
-                    rows = await self.db.list_accounts()
-                    if not rows:
-                        await cq.answer("Нет аккаунтов", show_alert=True)
-                        return
-                    buttons = [
-                        [InlineKeyboardButton(
-                            f"❌ {r['name']} ({r['phone']})",
-                            callback_data=f"acc:del:{r['id']}"
-                        )]
-                        for r in rows
-                    ]
-                    await cq.message.edit_text(
-                        "Кого удалить?", reply_markup=InlineKeyboardMarkup(buttons)
-                    )
-                    await cq.answer()
-                    return
-
-                if data.startswith("acc:del:"):
-                    acc_id = int(data.split(":")[2])
-                    await self.db.delete_account(acc_id)
-                    await cq.message.edit_text("✅ Аккаунт удалён.")
-                    await cq.answer()
-                    return
-
                 if data == "ses:add":
-                    if not await self.db.list_accounts():
-                        await cq.answer("Сначала добавь аккаунт", show_alert=True)
+                    sessions = list_sessions(self.sessions_dir)
+                    if not sessions:
+                        await cq.answer("Нет .session файлов в папке", show_alert=True)
                         return
                     self.fsm["state"] = "ses:name"
                     await cq.message.edit_text("Введи название сессии рассылки:")
@@ -700,14 +632,12 @@ class ManagerBot:
                     if not row:
                         await cq.answer("Не найдено", show_alert=True)
                         return
-                    acc = await self.db.get_account(row["account_id"])
                     sources = json.loads(row["sources"])
                     targets = json.loads(row["targets"])
                     state = row["state"]
                     txt = (
                         f"⚙️ Сессия #{row['id']} — {row['name']}\n"
-                        f"Аккаунт: {acc['name'] if acc else '?'} "
-                        f"({acc['phone'] if acc else '?'})\n"
+                        f"Аккаунт (.session): `{row['session_name']}`\n"
                         f"Статус: {state}\n\n"
                         f"📥 Источники ({len(sources)}):\n"
                         + "\n".join(f"  • {s}" for s in sources)
@@ -842,11 +772,12 @@ class ManagerBot:
                     await cq.answer("Переключено")
                     return
 
-                if data.startswith("ses:pick_acc:"):
-                    acc_id = int(data.split(":")[2])
-                    self.fsm["ses_account_id"] = acc_id
+                if data.startswith("ses:pick_sess:"):
+                    session_name = data.split(":", 2)[2]
+                    self.fsm["ses_session_name"] = session_name
                     self.fsm["state"] = "ses:sources"
                     await cq.message.edit_text(
+                        f"Аккаунт: `{session_name}`\n\n"
                         "Пришли источники (откуда пересылать) через запятую или пробел.\n"
                         "Можно несколько ссылок."
                     )
@@ -867,128 +798,25 @@ class ManagerBot:
                 return
             text = m.text.strip()
 
-            # ---------- ACC ----------
-            if state == "acc:name":
-                self.fsm["acc_name"] = text
-                self.fsm["state"] = "acc:api_id"
-                await m.reply("Введи api_id (число из my.telegram.org):")
-                return
-
-            if state == "acc:api_id":
-                if not text.isdigit():
-                    await m.reply("api_id должен быть числом. Попробуй снова:")
-                    return
-                self.fsm["acc_api_id"] = int(text)
-                self.fsm["state"] = "acc:api_hash"
-                await m.reply("Введи api_hash:")
-                return
-
-            if state == "acc:api_hash":
-                self.fsm["acc_api_hash"] = text
-                self.fsm["state"] = "acc:phone"
-                await m.reply("Введи номер телефона в формате +79990001122:")
-                return
-
-            if state == "acc:phone":
-                phone = text.replace(" ", "")
-                if not phone.startswith("+"):
-                    await m.reply("Номер должен начинаться с +. Попробуй снова:")
-                    return
-                name = self.fsm["acc_name"]
-                api_id = self.fsm["acc_api_id"]
-                api_hash = self.fsm["acc_api_hash"]
-                session_name = f"acc_{name}_{int(asyncio.get_event_loop().time())}"
-
-                try:
-                    cli = Client(
-                        name=session_name,
-                        api_id=api_id, api_hash=api_hash,
-                        phone_number=phone,
-                        workdir=str(self.sessions_dir),
-                    )
-                    # ВАЖНО: не start(), а connect() — держим соединение
-                    # открытым, чтобы phone_code_hash не протух
-                    await cli.connect()
-                    sent = await cli.send_code(phone)
-                    self.fsm["state"] = "acc:code"
-                    self.fsm["_cli"] = cli
-                    self.fsm["_phone"] = phone
-                    self.fsm["_phone_code_hash"] = sent.phone_code_hash
-                    self.fsm["_session_name"] = session_name
-                    await m.reply(
-                        "📲 Код отправлен. Введи его сюда как можно быстрее.\n"
-                        "Если протух — /resend выпустит новый."
-                    )
-                except Exception as e:
-                    self.log.exception("send_code error")
-                    await m.reply(f"Ошибка: {e}")
-                    self.fsm.pop("state", None)
-                return
-
-            if state == "acc:code":
-                cli: Client = self.fsm["_cli"]
-                phone = self.fsm["_phone"]
-                phone_code_hash = self.fsm["_phone_code_hash"]
-                try:
-                    await cli.sign_in(phone, phone_code_hash, text)
-                except SessionPasswordNeeded:
-                    self.fsm["state"] = "acc:2fa"
-                    await m.reply("Введи пароль 2FA:")
-                    return
-                except (PhoneCodeInvalid, PhoneCodeExpired) as e:
-                    # Автоматически перевыпускаем код и остаёмся в том же
-                    # состоянии, чтобы пользователь ввёл свежий код
-                    try:
-                        self.log.warning(f"Code expired ({e}), перевыпускаю...")
-                        sent = await cli.send_code(phone)
-                        self.fsm["_phone_code_hash"] = sent.phone_code_hash
-                        await m.reply(
-                            "♻️ Старый код протух. Отправил новый — введи его сразу:"
-                        )
-                    except FloodWait as fw:
-                        await m.reply(
-                            f"⏳ Telegram просит подождать {fw.value}s. "
-                            f"Потом нажми /resend."
-                        )
-                        self.fsm.pop("state", None)
-                    except Exception as e2:
-                        await m.reply(
-                            f"Не удалось перевыпустить код: {e2}\n"
-                            f"Нажми /cancel и попробуй снова."
-                        )
-                        self.fsm.pop("state", None)
-                    return
-                except Exception as e:
-                    self.log.exception("sign_in error")
-                    await m.reply(f"Ошибка входа: {e}")
-                    self.fsm.pop("state", None)
-                    return
-                await self._save_account(cli, m)
-                return
-
-            if state == "acc:2fa":
-                cli: Client = self.fsm["_cli"]
-                try:
-                    await cli.check_password(text)
-                except Exception as e:
-                    await m.reply(f"Неверный пароль: {e}")
-                    return
-                await self._save_account(cli, m)
-                return
-
-            # ---------- SES ----------
             if state == "ses:name":
                 self.fsm["ses_name"] = text
-                rows = await self.db.list_accounts()
+                sessions = list_sessions(self.sessions_dir)
+                if not sessions:
+                    await m.reply(
+                        "❌ Нет .session файлов. Закинь их в папку и начни заново."
+                    )
+                    self.fsm.pop("state", None)
+                    return
                 buttons = [
                     [InlineKeyboardButton(
-                        f"{r['name']} ({r['phone']})",
-                        callback_data=f"ses:pick_acc:{r['id']}"
-                    )] for r in rows
+                        s, callback_data=f"ses:pick_sess:{s}"
+                    )] for s in sessions
                 ]
-                self.fsm["state"] = "ses:pick_acc"
-                await m.reply("Выбери аккаунт для рассылки:",
-                              reply_markup=InlineKeyboardMarkup(buttons))
+                self.fsm["state"] = "ses:pick_sess"
+                await m.reply(
+                    "Выбери аккаунт (файл .session) для рассылки:",
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                )
                 return
 
             if state == "ses:sources":
@@ -998,7 +826,9 @@ class ManagerBot:
                     return
                 self.fsm["ses_sources"] = items
                 self.fsm["state"] = "ses:targets"
-                await m.reply(f"Принято {len(items)} источников. Теперь цели через запятую:")
+                await m.reply(
+                    f"Принято {len(items)} источников. Теперь цели через запятую:"
+                )
                 return
 
             if state == "ses:targets":
@@ -1006,13 +836,16 @@ class ManagerBot:
                 if not items:
                     await m.reply("Пусто. Попробуй снова или /cancel")
                     return
-                acc_id = self.fsm["ses_account_id"]
+                session_name = self.fsm["ses_session_name"]
                 name = self.fsm["ses_name"]
                 sources = self.fsm["ses_sources"]
-                sid = await self.db.add_session(name, acc_id, sources, items)
+                sid = await self.db.add_session(
+                    name, session_name, sources, items
+                )
                 self.fsm.pop("state", None)
                 await m.reply(
                     f"✅ Сессия #{sid} {name} создана.\n"
+                    f"Аккаунт: `{session_name}`\n"
                     f"Запустить: /sessions → выбери её."
                 )
                 return
@@ -1053,43 +886,21 @@ class ManagerBot:
                 await m.reply(f"✅ Интервал = {val}s")
                 return
 
-    async def _save_account(self, cli: Client, m: Message):
-        name = self.fsm["acc_name"]
-        api_id = self.fsm["acc_api_id"]
-        api_hash = self.fsm["acc_api_hash"]
-        phone = self.fsm["_phone"]
-        session_name = self.fsm["_session_name"]
-
-        # ВАЖНО: stop() (а не disconnect) — корректно финализирует
-        # .session файл, чтобы дальше его можно было использовать
-        try:
-            await cli.stop()
-        except Exception:
-            pass
-
-        try:
-            await self.db.add_account(name, api_id, api_hash, phone, session_name)
-        except Exception as e:
-            await m.reply(f"❌ Ошибка сохранения: {e}")
-            self.fsm.pop("state", None)
-            return
-
-        self.fsm.pop("state", None)
-        await m.reply(
-            f"✅ Аккаунт {name} добавлен.\n"
-            f"Теперь можешь создавать сессии: /new"
-        )
-
     async def _start_session(self, sid: int):
         if sid in self.running:
             return
         row = await self.db.get_session(sid)
         if not row:
             return
-        acc = await self.db.get_account(row["account_id"])
-        if not acc:
+        # проверка, что файл сессии существует
+        sess_file = self.sessions_dir / f"{row['session_name']}.session"
+        if not sess_file.exists():
+            self.log.error(
+                f"[S{sid}] Файл сессии не найден: {sess_file}"
+            )
+            await self.db.update_session(sid, state="stopped")
             return
-        task = BroadcastTask(row, acc, self)
+        task = BroadcastTask(row, self)
         self.running[sid] = task
         await self.db.update_session(sid, state="running")
         await task.start()
@@ -1104,6 +915,9 @@ class ManagerBot:
         await self.app.start()
         me = await self.app.get_me()
         self.log.info(f"Бот запущен: @{me.username}")
+
+        sessions = list_sessions(self.sessions_dir)
+        self.log.info(f"Найдено .session файлов: {len(sessions)} → {sessions}")
 
         rows = await self.db.list_sessions()
         for r in rows:
