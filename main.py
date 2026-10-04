@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Менеджер рассылок Telegram.
-Аккаунты берутся из готовых .session файлов в data/sessions/.
-Никакого добавления аккаунтов через бота — просто закинь файлы.
+Аккаунты берутся из SESSION_STRINGS в config.py (Pyrogram string session)
+либо из .session файлов в корне.
 """
 
 import asyncio
@@ -38,6 +38,7 @@ def load_config() -> dict:
         "bot": cfg_module.BOT,
         "defaults": cfg_module.DEFAULTS,
         "settings": cfg_module.SETTINGS,
+        "session_strings": getattr(cfg_module, "SESSION_STRINGS", {}),
     }
 
 
@@ -57,7 +58,7 @@ def _defaults_dict():
 # =========================================================
 def setup_logger(cfg: dict) -> logging.Logger:
     log_level = cfg.get("settings", {}).get("log_level", "INFO")
-    log_file = cfg.get("settings", {}).get("log_file", "data/logs/bot.log")
+    log_file = cfg.get("settings", {}).get("log_file", "logs/bot.log")
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("manager")
@@ -79,15 +80,22 @@ def setup_logger(cfg: dict) -> logging.Logger:
 # =========================================================
 # SESSION SCANNER
 # =========================================================
-def list_sessions(sessions_dir: Path) -> List[str]:
-    """Возвращает список имён .session файлов (без расширения)."""
-    if not sessions_dir.exists():
-        return []
-    out = []
-    for p in sorted(sessions_dir.glob("*.session")):
-        if p.stem == "manager_bot":
-            continue  # сессия самого бота-менеджера
-        out.append(p.stem)
+def list_sessions(sessions_dir: Path, session_strings: Dict[str, str]) -> List[str]:
+    """Доступные аккаунты: сначала строковые, потом .session файлы."""
+    out: List[str] = []
+
+    for name in session_strings.keys():
+        if name and name not in out:
+            out.append(name)
+
+    if sessions_dir.exists():
+        for p in sorted(sessions_dir.glob("*.session")):
+            if p.stem == "manager_bot":
+                continue
+            if p.stem in out:
+                continue
+            out.append(p.stem)
+
     return out
 
 
@@ -278,14 +286,35 @@ class BroadcastTask:
             except Exception:
                 pass
 
-    async def _run(self):
-        try:
-            self.client = Client(
+    def _make_client(self) -> Client:
+        """Строковая сессия в приоритете, иначе — .session файл."""
+        session_string = self.app.cfg.get("session_strings", {}).get(self.session_name)
+
+        if session_string:
+            self.log.info(
+                f"[S{self.sid}:{self.name}] string session: {self.session_name}"
+            )
+            return Client(
+                name=self.session_name,
+                api_id=self.app.cfg["bot"]["api_id"],
+                api_hash=self.app.cfg["bot"]["api_hash"],
+                session_string=session_string,
+                in_memory=True,
+            )
+        else:
+            self.log.info(
+                f"[S{self.sid}:{self.name}] файл {self.session_name}.session"
+            )
+            return Client(
                 name=self.session_name,
                 api_id=self.app.cfg["bot"]["api_id"],
                 api_hash=self.app.cfg["bot"]["api_hash"],
                 workdir=str(self.app.sessions_dir),
             )
+
+    async def _run(self):
+        try:
+            self.client = self._make_client()
             self.log.info(f"[S{self.sid}:{self.name}] Старт сессии {self.session_name}...")
             await self.client.start()
             me = await self.client.get_me()
@@ -501,6 +530,7 @@ class ManagerBot:
         self.owner_id = int(cfg["bot"]["owner_id"])
         self.sessions_dir = Path(cfg["settings"]["sessions_dir"])
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.session_strings = cfg.get("session_strings", {})
 
         self.app = Client(
             name="manager_bot",
@@ -526,9 +556,7 @@ class ManagerBot:
             self.fsm.pop("state", None)
             await m.reply(
                 "👋 Менеджер рассылок\n\n"
-                "Аккаунты берутся из готовых `.session` файлов в папке "
-                "`data/sessions/`. Просто закинь туда файлы — бот их увидит.\n\n"
-                "• /accounts — список найденных сессий\n"
+                "• /accounts — список аккаунтов\n"
                 "• /sessions — сессии рассылки\n"
                 "• /new — создать сессию рассылки\n"
                 "• /cancel — отменить действие\n"
@@ -541,19 +569,17 @@ class ManagerBot:
 
         @app.on_message(filters.command("accounts") & owner_filter)
         async def cmd_accounts(_, m: Message):
-            sessions = list_sessions(self.sessions_dir)
-            text = "📱 **Готовые сессии** (файлы .session)\n\n"
+            sessions = list_sessions(self.sessions_dir, self.session_strings)
+            text = "📱 **Доступные аккаунты**\n\n"
             if not sessions:
                 text += (
-                    "❌ Не найдено ни одной сессии.\n\n"
-                    "Закинь файлы `*.session` в папку:\n"
-                    f"`{self.sessions_dir}`"
+                    "❌ Пусто.\n\n"
+                    "Добавь строку в `SESSION_STRINGS` в `config.py`."
                 )
             else:
-                text += f"Папка: `{self.sessions_dir}`\n\n"
                 for i, name in enumerate(sessions, 1):
-                    text += f"{i}. `{name}`\n"
-                text += "\nЧтобы обновить список, отправь /accounts ещё раз."
+                    src = "🔑 string" if name in self.session_strings else "📄 file"
+                    text += f"{i}. `{name}` — {src}\n"
             await m.reply(text)
 
         @app.on_message(filters.command("sessions") & owner_filter)
@@ -578,11 +604,11 @@ class ManagerBot:
 
         @app.on_message(filters.command("new") & owner_filter)
         async def cmd_new(_, m: Message):
-            sessions = list_sessions(self.sessions_dir)
+            sessions = list_sessions(self.sessions_dir, self.session_strings)
             if not sessions:
                 await m.reply(
-                    "❌ Нет готовых .session файлов.\n"
-                    f"Закинь их в `{self.sessions_dir}` и попробуй снова."
+                    "❌ Нет доступных аккаунтов.\n"
+                    "Добавь строку в `SESSION_STRINGS` в `config.py`."
                 )
                 return
             self.fsm["state"] = "ses:name"
@@ -593,9 +619,9 @@ class ManagerBot:
             data = cq.data or ""
             try:
                 if data == "ses:add":
-                    sessions = list_sessions(self.sessions_dir)
+                    sessions = list_sessions(self.sessions_dir, self.session_strings)
                     if not sessions:
-                        await cq.answer("Нет .session файлов в папке", show_alert=True)
+                        await cq.answer("Нет аккаунтов", show_alert=True)
                         return
                     self.fsm["state"] = "ses:name"
                     await cq.message.edit_text("Введи название сессии рассылки:")
@@ -637,7 +663,7 @@ class ManagerBot:
                     state = row["state"]
                     txt = (
                         f"⚙️ Сессия #{row['id']} — {row['name']}\n"
-                        f"Аккаунт (.session): `{row['session_name']}`\n"
+                        f"Аккаунт: `{row['session_name']}`\n"
                         f"Статус: {state}\n\n"
                         f"📥 Источники ({len(sources)}):\n"
                         + "\n".join(f"  • {s}" for s in sources)
@@ -800,11 +826,9 @@ class ManagerBot:
 
             if state == "ses:name":
                 self.fsm["ses_name"] = text
-                sessions = list_sessions(self.sessions_dir)
+                sessions = list_sessions(self.sessions_dir, self.session_strings)
                 if not sessions:
-                    await m.reply(
-                        "❌ Нет .session файлов. Закинь их в папку и начни заново."
-                    )
+                    await m.reply("❌ Нет аккаунтов. Добавь строку в config.py.")
                     self.fsm.pop("state", None)
                     return
                 buttons = [
@@ -814,7 +838,7 @@ class ManagerBot:
                 ]
                 self.fsm["state"] = "ses:pick_sess"
                 await m.reply(
-                    "Выбери аккаунт (файл .session) для рассылки:",
+                    "Выбери аккаунт для рассылки:",
                     reply_markup=InlineKeyboardMarkup(buttons),
                 )
                 return
@@ -892,14 +916,19 @@ class ManagerBot:
         row = await self.db.get_session(sid)
         if not row:
             return
-        # проверка, что файл сессии существует
-        sess_file = self.sessions_dir / f"{row['session_name']}.session"
-        if not sess_file.exists():
+
+        session_name = row["session_name"]
+        # Проверка: есть ли строковая сессия или файл
+        has_string = session_name in self.session_strings
+        has_file = (self.sessions_dir / f"{session_name}.session").exists()
+
+        if not has_string and not has_file:
             self.log.error(
-                f"[S{sid}] Файл сессии не найден: {sess_file}"
+                f"[S{sid}] Ни string, ни .session файла для '{session_name}'"
             )
             await self.db.update_session(sid, state="stopped")
             return
+
         task = BroadcastTask(row, self)
         self.running[sid] = task
         await self.db.update_session(sid, state="running")
@@ -916,8 +945,8 @@ class ManagerBot:
         me = await self.app.get_me()
         self.log.info(f"Бот запущен: @{me.username}")
 
-        sessions = list_sessions(self.sessions_dir)
-        self.log.info(f"Найдено .session файлов: {len(sessions)} → {sessions}")
+        sessions = list_sessions(self.sessions_dir, self.session_strings)
+        self.log.info(f"Найдено аккаунтов: {len(sessions)} → {sessions}")
 
         rows = await self.db.list_sessions()
         for r in rows:
