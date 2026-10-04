@@ -552,6 +552,7 @@ class ManagerBot:
                 "• /accounts — аккаунты (от чьего имени шлём)\n"
                 "• /sessions — сессии рассылки\n"
                 "• /new — создать сессию\n"
+                "• /resend — выпустить новый код при входе\n"
                 "• /cancel — отменить действие\n"
             )
 
@@ -565,6 +566,24 @@ class ManagerBot:
                     pass
             self.fsm.pop("state", None)
             await m.reply("Отменено.")
+
+        @app.on_message(filters.command("resend") & owner_filter)
+        async def cmd_resend(_, m: Message):
+            cli: Optional[Client] = self.fsm.get("_cli")
+            phone = self.fsm.get("_phone")
+            state = self.fsm.get("state")
+            if not cli or not phone or state not in ("acc:code", "acc:2fa"):
+                await m.reply("Сейчас нет активного ввода кода.")
+                return
+            try:
+                sent = await cli.send_code(phone)
+                self.fsm["_phone_code_hash"] = sent.phone_code_hash
+                self.fsm["state"] = "acc:code"
+                await m.reply("♻️ Новый код отправлен. Введи его:")
+            except FloodWait as fw:
+                await m.reply(f"⏳ Подожди {fw.value}s, потом попробуй снова.")
+            except Exception as e:
+                await m.reply(f"Ошибка: {e}")
 
         @app.on_message(filters.command("accounts") & owner_filter)
         async def cmd_accounts(_, m: Message):
@@ -880,10 +899,6 @@ class ManagerBot:
                 api_hash = self.fsm["acc_api_hash"]
                 session_name = f"acc_{name}_{int(asyncio.get_event_loop().time())}"
 
-                await m.reply(
-                    "📲 Сейчас придёт код от Telegram. "
-                    "Введи код БЕЗ пробелов, например 12345."
-                )
                 try:
                     cli = Client(
                         name=session_name,
@@ -891,6 +906,8 @@ class ManagerBot:
                         phone_number=phone,
                         workdir=str(self.sessions_dir),
                     )
+                    # ВАЖНО: не start(), а connect() — держим соединение
+                    # открытым, чтобы phone_code_hash не протух
                     await cli.connect()
                     sent = await cli.send_code(phone)
                     self.fsm["state"] = "acc:code"
@@ -898,7 +915,10 @@ class ManagerBot:
                     self.fsm["_phone"] = phone
                     self.fsm["_phone_code_hash"] = sent.phone_code_hash
                     self.fsm["_session_name"] = session_name
-                    await m.reply("Введи код:")
+                    await m.reply(
+                        "📲 Код отправлен. Введи его сюда как можно быстрее.\n"
+                        "Если протух — /resend выпустит новый."
+                    )
                 except Exception as e:
                     self.log.exception("send_code error")
                     await m.reply(f"Ошибка: {e}")
@@ -916,7 +936,27 @@ class ManagerBot:
                     await m.reply("Введи пароль 2FA:")
                     return
                 except (PhoneCodeInvalid, PhoneCodeExpired) as e:
-                    await m.reply(f"Код неверный/просрочен: {e}. Введи заново или /cancel")
+                    # Автоматически перевыпускаем код и остаёмся в том же
+                    # состоянии, чтобы пользователь ввёл свежий код
+                    try:
+                        self.log.warning(f"Code expired ({e}), перевыпускаю...")
+                        sent = await cli.send_code(phone)
+                        self.fsm["_phone_code_hash"] = sent.phone_code_hash
+                        await m.reply(
+                            "♻️ Старый код протух. Отправил новый — введи его сразу:"
+                        )
+                    except FloodWait as fw:
+                        await m.reply(
+                            f"⏳ Telegram просит подождать {fw.value}s. "
+                            f"Потом нажми /resend."
+                        )
+                        self.fsm.pop("state", None)
+                    except Exception as e2:
+                        await m.reply(
+                            f"Не удалось перевыпустить код: {e2}\n"
+                            f"Нажми /cancel и попробуй снова."
+                        )
+                        self.fsm.pop("state", None)
                     return
                 except Exception as e:
                     self.log.exception("sign_in error")
@@ -1020,7 +1060,12 @@ class ManagerBot:
         phone = self.fsm["_phone"]
         session_name = self.fsm["_session_name"]
 
-        await cli.disconnect()
+        # ВАЖНО: stop() (а не disconnect) — корректно финализирует
+        # .session файл, чтобы дальше его можно было использовать
+        try:
+            await cli.stop()
+        except Exception:
+            pass
 
         try:
             await self.db.add_account(name, api_id, api_hash, phone, session_name)
@@ -1031,7 +1076,8 @@ class ManagerBot:
 
         self.fsm.pop("state", None)
         await m.reply(
-            f"✅ Аккаунт {name} добавлен.\nТеперь можешь создавать сессии: /new"
+            f"✅ Аккаунт {name} добавлен.\n"
+            f"Теперь можешь создавать сессии: /new"
         )
 
     async def _start_session(self, sid: int):
