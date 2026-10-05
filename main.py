@@ -147,10 +147,6 @@ class DB:
         cur = await self.conn.execute("SELECT * FROM accounts WHERE id=?", (acc_id,))
         return await cur.fetchone()
 
-    async def get_account_by_name(self, name: str):
-        cur = await self.conn.execute("SELECT * FROM accounts WHERE name=?", (name,))
-        return await cur.fetchone()
-
     async def delete_account(self, acc_id: int):
         await self.conn.execute("DELETE FROM accounts WHERE id=?", (acc_id,))
         await self.conn.commit()
@@ -238,7 +234,6 @@ async def resolve_target_with_fallback(client: Client, link: str, log: logging.L
 
 
 def distribute_targets(targets: List[str], n: int) -> List[List[str]]:
-    """Раскидывает список targets на n примерно равных частей."""
     buckets: List[List[str]] = [[] for _ in range(n)]
     for i, t in enumerate(targets):
         buckets[i % n].append(t)
@@ -292,7 +287,6 @@ class BroadcastTask:
         self.account = account_row
 
         self.sources_raw = json.loads(session_row["sources"])
-        # targets у каждой подзадачи — свой срез (распределено между аккаунтами)
         self.targets_raw: List[str] = []
         self.interval_sec = float(session_row["interval_sec"])
         self.target_delay_sec = float(session_row["target_delay_sec"])
@@ -353,9 +347,7 @@ class BroadcastTask:
     async def _run(self):
         try:
             self.client = self._make_client()
-            self.log.info(
-                f"[S{self.sid}:{self.name}:acc{self.account_id}] Старт..."
-            )
+            self.log.info(f"[S{self.sid}:{self.name}:acc{self.account_id}] Старт...")
             await self.client.start()
             me = await self.client.get_me()
             self.log.info(
@@ -363,7 +355,6 @@ class BroadcastTask:
                 f"Вход: {me.first_name} (@{me.username})"
             )
 
-            # прогрев
             try:
                 count = 0
                 async for _d in self.client.get_dialogs():
@@ -427,9 +418,7 @@ class BroadcastTask:
             asyncio.create_task(self._load_history())
 
             await self._stop.wait()
-            self.log.info(
-                f"[S{self.sid}:{self.name}:acc{self.account_id}] Остановлен."
-            )
+            self.log.info(f"[S{self.sid}:{self.name}:acc{self.account_id}] Остановлен.")
             try:
                 await self.client.stop()
             except Exception:
@@ -617,11 +606,80 @@ class ManagerBot:
     async def set_session_state(self, sid: int, state: str):
         await self.db.update_session(sid, state=state)
 
+    # ---------- ОТДЕЛЬНЫЕ МЕТОДЫ (нужны для self._show_*) ----------
+    async def _show_accounts(self, message: Message, edit: bool = False):
+        rows = await self.db.list_accounts()
+        text = "📱 **Аккаунты**\n\n"
+        if not rows:
+            text += "Пока нет ни одного аккаунта."
+        else:
+            for r in rows:
+                typ = "🔑 string" if r["session_string"] else "📄 file"
+                text += f"`#{r['id']}` **{r['name']}** — {typ}\n"
+        buttons = [
+            [InlineKeyboardButton("➕ Добавить сессию", callback_data="acc:add")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data="acc:del_menu")],
+        ]
+        if edit:
+            await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            await message.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+    async def _show_sessions(self, message: Message, edit: bool = False):
+        rows = await self.db.list_sessions()
+        text = "📋 **Сессии рассылки**\n\n"
+        if not rows:
+            text += "Пока нет ни одной сессии."
+        else:
+            for r in rows:
+                emoji = "🟢" if r["state"] == "running" else "⚪️"
+                try:
+                    acc_ids = json.loads(r["account_ids"])
+                    accs = len(acc_ids)
+                except Exception:
+                    accs = 0
+                text += f"{emoji} `#{r['id']}` **{r['name']}** — акк: {accs}\n"
+        buttons = []
+        for r in rows:
+            buttons.append([InlineKeyboardButton(
+                f"#{r['id']} {r['name']}", callback_data=f"ses:view:{r['id']}"
+            )])
+        buttons.append([InlineKeyboardButton(
+            "➕ Создать сессию", callback_data="ses:add"
+        )])
+        if edit:
+            await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            await message.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+    async def _render_account_picker(self, message: Message, edit: bool = False):
+        rows = await self.db.list_accounts()
+        sel = self.fsm.get("ses_selected", [])
+        buttons = []
+        for a in rows:
+            mark = "✅" if a["id"] in sel else "▫️"
+            buttons.append([InlineKeyboardButton(
+                f"{mark} {a['name']}",
+                callback_data=f"pick:{a['id']}"
+            )])
+        buttons.append([InlineKeyboardButton("✔️ Готово", callback_data="pick:done")])
+        text = (
+            f"Выбери аккаунты для рассылки (отмечено: {len(sel)}).\n"
+            "Можно несколько. Когда закончишь — «Готово»."
+        )
+        if edit:
+            try:
+                await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+            except Exception:
+                pass
+        else:
+            await message.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+    # ---------- HANDLERS ----------
     def _register_handlers(self):
         app = self.app
         owner_filter = filters.private & filters.user(self.owner_id)
 
-        # ---------- /start ----------
         @app.on_message(filters.command("start") & owner_filter)
         async def cmd_start(_, m: Message):
             self.fsm.pop("state", None)
@@ -636,55 +694,16 @@ class ManagerBot:
         @app.on_message(filters.command("cancel") & owner_filter)
         async def cmd_cancel(_, m: Message):
             self.fsm.pop("state", None)
-            self.fsm.pop("acc_pending", None)
             await m.reply("Отменено.")
 
-        # ---------- /accounts ----------
         @app.on_message(filters.command("accounts") & owner_filter)
         async def cmd_accounts(_, m: Message):
             await self._show_accounts(m)
 
-        async def _show_accounts(message: Message):
-            rows = await self.db.list_accounts()
-            text = "📱 **Аккаунты**\n\n"
-            if not rows:
-                text += "Пока нет ни одного аккаунта."
-            else:
-                for r in rows:
-                    typ = "🔑 string" if r["session_string"] else "📄 file"
-                    text += f"`#{r['id']}` **{r['name']}** — {typ}\n"
-            buttons = [
-                [InlineKeyboardButton("➕ Добавить сессию", callback_data="acc:add")],
-                [InlineKeyboardButton("🗑 Удалить", callback_data="acc:del_menu")],
-            ]
-            await message.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
-
-        # ---------- /sessions ----------
         @app.on_message(filters.command("sessions") & owner_filter)
         async def cmd_sessions(_, m: Message):
             await self._show_sessions(m)
 
-        async def _show_sessions(message: Message):
-            rows = await self.db.list_sessions()
-            text = "📋 **Сессии рассылки**\n\n"
-            if not rows:
-                text += "Пока нет ни одной сессии."
-            else:
-                for r in rows:
-                    emoji = "🟢" if r["state"] == "running" else "⚪️"
-                    acc_ids = json.loads(r["account_ids"])
-                    text += f"{emoji} `#{r['id']}` **{r['name']}** — акк: {len(acc_ids)}\n"
-            buttons = []
-            for r in rows:
-                buttons.append([InlineKeyboardButton(
-                    f"#{r['id']} {r['name']}", callback_data=f"ses:view:{r['id']}"
-                )])
-            buttons.append([InlineKeyboardButton(
-                "➕ Создать сессию", callback_data="ses:add"
-            )])
-            await message.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
-
-        # ---------- /new ----------
         @app.on_message(filters.command("new") & owner_filter)
         async def cmd_new(_, m: Message):
             rows = await self.db.list_accounts()
@@ -694,10 +713,10 @@ class ManagerBot:
             self.fsm["state"] = "ses:name"
             await m.reply("Введи название рассылки:")
 
-        # ---------- text handler (FSM + session string) ----------
+        # ---------- TEXT ----------
         @app.on_message(filters.text & owner_filter, group=1)
         async def fsm_handler(_, m: Message):
-            # 1) приём string-сессии
+            # приём string-сессии
             if self.fsm.get("state") == "acc:string_wait":
                 text = m.text.strip()
                 if not text or len(text) < 100:
@@ -714,7 +733,6 @@ class ManagerBot:
                 await m.reply(f"✅ Аккаунт `{name}` добавлен (string).")
                 return
 
-            # 2) остальные FSM-шаги
             state = self.fsm.get("state")
             if not state:
                 return
@@ -732,13 +750,13 @@ class ManagerBot:
 
             if state == "ses:name":
                 self.fsm["ses_name"] = text
-                # список аккаунтов для мультивыбора
                 rows = await self.db.list_accounts()
                 if not rows:
                     await m.reply("❌ Нет аккаунтов.")
                     self.fsm.pop("state", None)
                     return
                 self.fsm["ses_selected"] = []
+                self.fsm["state"] = "ses:pick_acc"
                 await self._render_account_picker(m)
                 return
 
@@ -810,7 +828,7 @@ class ManagerBot:
                 await m.reply(f"✅ Интервал = {val}s")
                 return
 
-        # ---------- документ .session ----------
+        # ---------- DOCUMENT ----------
         @app.on_message(filters.document & owner_filter, group=1)
         async def doc_handler(_, m: Message):
             if self.fsm.get("state") != "acc:string_wait":
@@ -837,7 +855,7 @@ class ManagerBot:
                 f"✅ Аккаунт `{name}` добавлен (файл `{doc.file_name}`)."
             )
 
-        # ---------- callback'и ----------
+        # ---------- CALLBACK ----------
         @app.on_callback_query(filters.user(self.owner_id))
         async def on_cb(_, cq: CallbackQuery):
             data = cq.data or ""
@@ -870,8 +888,7 @@ class ManagerBot:
                     return
 
                 if data == "acc:back":
-                    await cq.message.delete()
-                    await self._show_accounts(cq.message)
+                    await self._show_accounts(cq.message, edit=True)
                     await cq.answer()
                     return
 
@@ -894,32 +911,26 @@ class ManagerBot:
                     return
 
                 if data == "ses:list":
-                    rows = await self.db.list_sessions()
-                    text = "📋 **Сессии рассылки**\n\n"
-                    if not rows:
-                        text += "Пока нет ни одной сессии."
-                    else:
-                        for r in rows:
-                            emoji = "🟢" if r["state"] == "running" else "⚪️"
-                            acc_ids = json.loads(r["account_ids"])
-                            text += f"{emoji} `#{r['id']}` **{r['name']}** — акк: {len(acc_ids)}\n"
-                    buttons = []
-                    for r in rows:
-                        buttons.append([InlineKeyboardButton(
-                            f"#{r['id']} {r['name']}",
-                            callback_data=f"ses:view:{r['id']}"
-                        )])
-                    buttons.append([InlineKeyboardButton(
-                        "➕ Создать сессию", callback_data="ses:add"
-                    )])
-                    await cq.message.edit_text(
-                        text, reply_markup=InlineKeyboardMarkup(buttons)
-                    )
+                    await self._show_sessions(cq.message, edit=True)
                     await cq.answer()
                     return
 
-                # ---- выбор аккаунтов (мультивыбор) ----
+                # ---- мультивыбор аккаунтов ----
                 if data.startswith("pick:"):
+                    if data == "pick:done":
+                        sel = self.fsm.get("ses_selected", [])
+                        if not sel:
+                            await cq.answer("Выбери хотя бы один аккаунт", show_alert=True)
+                            return
+                        self.fsm["state"] = "ses:sources"
+                        await cq.message.edit_text(
+                            f"Выбрано аккаунтов: {len(sel)}.\n\n"
+                            "Пришли **источники** (откуда пересылать) через запятую "
+                            "или пробел."
+                        )
+                        await cq.answer()
+                        return
+
                     acc_id = int(data.split(":")[1])
                     sel = self.fsm.setdefault("ses_selected", [])
                     if acc_id in sel:
@@ -927,20 +938,6 @@ class ManagerBot:
                     else:
                         sel.append(acc_id)
                     await self._render_account_picker(cq.message, edit=True)
-                    await cq.answer()
-                    return
-
-                if data == "pick:done":
-                    sel = self.fsm.get("ses_selected", [])
-                    if not sel:
-                        await cq.answer("Выбери хотя бы один аккаунт", show_alert=True)
-                        return
-                    self.fsm["state"] = "ses:sources"
-                    await cq.message.edit_text(
-                        f"Выбрано аккаунтов: {len(sel)}.\n\n"
-                        "Пришли **источники** (откуда пересылать) через запятую "
-                        "или пробел."
-                    )
                     await cq.answer()
                     return
 
@@ -953,7 +950,10 @@ class ManagerBot:
                         return
                     sources = json.loads(row["sources"])
                     targets = json.loads(row["targets"])
-                    acc_ids = json.loads(row["account_ids"])
+                    try:
+                        acc_ids = json.loads(row["account_ids"])
+                    except Exception:
+                        acc_ids = []
                     state = row["state"]
                     txt = (
                         f"⚙️ **Сессия #{row['id']}** — `{row['name']}`\n"
@@ -1055,7 +1055,11 @@ class ManagerBot:
                     if not row:
                         await cq.answer("Не найдено", show_alert=True)
                         return
-                    cur_ids = json.loads(row["account_ids"])
+                    try:
+                        cur_ids = json.loads(row["account_ids"])
+                    except Exception:
+                        cur_ids = []
+                    self.fsm[f"edit_accs_pending:{sid}"] = list(cur_ids)
                     accs = await self.db.list_accounts()
                     buttons = []
                     for a in accs:
@@ -1070,7 +1074,6 @@ class ManagerBot:
                     buttons.append([InlineKeyboardButton(
                         "⬅️ Назад", callback_data=f"ses:view:{sid}"
                     )])
-                    self.fsm[f"edit_accs_pending:{sid}"] = list(cur_ids)
                     await cq.message.edit_text(
                         "Отметь аккаунты кнопками, потом «Сохранить»:",
                         reply_markup=InlineKeyboardMarkup(buttons),
@@ -1087,11 +1090,10 @@ class ManagerBot:
                         pending.remove(acc_id)
                     else:
                         pending.append(acc_id)
-                    cur_ids = pending
                     accs = await self.db.list_accounts()
                     buttons = []
                     for a in accs:
-                        mark = "✅" if a["id"] in cur_ids else "▫️"
+                        mark = "✅" if a["id"] in pending else "▫️"
                         buttons.append([InlineKeyboardButton(
                             f"{mark} {a['name']}",
                             callback_data=f"edit_accs_pick:{sid}:{a['id']}"
@@ -1147,51 +1149,36 @@ class ManagerBot:
                 except Exception:
                     pass
 
-    async def _render_account_picker(self, message: Message, edit: bool = False):
-        rows = await self.db.list_accounts()
-        sel = self.fsm.get("ses_selected", [])
-        buttons = []
-        for a in rows:
-            mark = "✅" if a["id"] in sel else "▫️"
-            buttons.append([InlineKeyboardButton(
-                f"{mark} {a['name']}",
-                callback_data=f"pick:{a['id']}"
-            )])
-        buttons.append([InlineKeyboardButton("✔️ Готово", callback_data="pick:done")])
-        text = (
-            f"Выбери аккаунты для рассылки (отмечено: {len(sel)}).\n"
-            "Можно несколько. Когда закончишь — «Готово»."
-        )
-        if edit:
-            try:
-                await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-            except Exception:
-                pass
-        else:
-            await message.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
-
+    # ---------- SESSION LIFECYCLE ----------
     async def _start_session(self, sid: int):
         if sid in self.running:
             return
         row = await self.db.get_session(sid)
         if not row:
             return
-        account_ids = json.loads(row["account_ids"])
+        try:
+            account_ids = json.loads(row["account_ids"])
+        except Exception:
+            account_ids = []
         targets = json.loads(row["targets"])
 
-        # распределяем цели между аккаунтами
+        if not account_ids:
+            self.log.error(f"[S{sid}] нет аккаунтов")
+            await self.db.update_session(sid, state="stopped")
+            return
+
         buckets = distribute_targets(targets, len(account_ids))
 
         tasks: List[BroadcastTask] = []
         for i, acc_id in enumerate(account_ids):
             acc = await self.db.get_account(acc_id)
             if not acc:
-                self.log.warning(f"[S{sid}] аккаунт #{acc_id} не найден, пропуск")
+                self.log.warning(f"[S{sid}] аккаунт #{acc_id} не найден")
                 continue
             task = BroadcastTask(row, self, acc_id, acc)
             task.targets_raw = buckets[i] if len(buckets) > i else []
             if not task.targets_raw:
-                self.log.info(f"[S{sid}] аккаунту {acc['name']} не досталось целей")
+                self.log.info(f"[S{sid}] {acc['name']}: 0 целей, пропуск")
                 continue
             tasks.append(task)
             await task.start()
@@ -1219,7 +1206,6 @@ class ManagerBot:
         me = await self.app.get_me()
         self.log.info(f"Бот запущен: @{me.username}")
 
-        # авто-возобновление
         rows = await self.db.list_sessions()
         for r in rows:
             if r["state"] == "running":
